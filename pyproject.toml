@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "heatsense"
+version = "0.1.0"
+description = "Heat-strain estimation for runners from wearable heart rate, pace and weather."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Ayoub" }]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "matplotlib>=3.7",
+    "fitdecode>=0.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "fit-tool>=0.9"]
+
+[project.scripts]
+heatsense = "heatsense.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
