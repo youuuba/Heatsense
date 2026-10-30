@@ -122,5 +122,5 @@ This is an engineering description, not legal advice.
 
 ## License
 
-MIT, see `LICENSE`. The license covers this code only and grants no rights under any
-third-party patent.
+Apache License 2.0, see `LICENSE` and `NOTICE`. The license covers this code only and
+grants no rights under any third-party patent.
