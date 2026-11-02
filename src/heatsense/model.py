@@ -49,7 +49,10 @@ class PhysicsParams:
     a_env: float = 0.057  # extra degC per degC WBGT above ref, per 10 W/kg
     wbgt_ref: float = 15.0  # degC; below this, environment adds no heat strain
     effort_lag_min: float = 1.0  # heart rate responds to effort with ~1 min lag
-    q_sd: float = 0.03  # process noise, degC per minute
+    # Process noise, degC per minute. Large on purpose: it stands for the physics model's own
+    # error (heat gain differs between runners and isn't learned), not true minute-to-minute
+    # randomness. Tuned so the ±2 SD band covers ~95% of true values on simulated athletes.
+    q_sd: float = 0.12
     ct0: float = 37.0
     ct0_sd: float = 0.15
     indoor_wbgt: float = 18.0  # assumed for treadmill / indoor runs
@@ -67,7 +70,8 @@ class Profile:
     hr_per_degc: float = 15.0  # bpm per degC core; PROVISIONAL prior, set properly by validation
     drift_per_min: float = 0.05  # bpm per active minute (cardiac drift)
     hr_max: float = 200.0
-    hr_noise_sd: float = 8.0  # bpm, minute-level
+    hr_noise_sd: float = 8.0  # bpm, minute-level residual SD
+    hr_noise_rho: float = 0.85  # lag-1 autocorrelation of minute-level residuals
     n_runs: int = 0
     n_minutes: int = 0
     source: str = "population default"
@@ -126,6 +130,18 @@ def physics_step(ct, met, wbgt, p: PhysicsParams):
     return eq + (np.asarray(ct) - eq) * np.exp(-1.0 / p.tau_min)
 
 
+def effective_hr_noise(prof: Profile) -> float:
+    """Observation noise SD (bpm) the filter uses per minute.
+
+    Heart-rate residuals are strongly autocorrelated from minute to minute, so each minute
+    is far less than one independent observation. Inflating the SD by
+    sqrt((1 + rho) / (1 - rho)) (the AR(1) variance-of-the-mean factor) keeps the filter
+    from treating 30 correlated minutes as 30 pieces of evidence. Fixed for the whole run.
+    """
+    rho = float(np.clip(prof.hr_noise_rho, 0.0, 0.95))
+    return prof.hr_noise_sd * np.sqrt((1 + rho) / (1 - rho))
+
+
 def predict_hr(ct, met_lagged, active_min, prof: Profile, k: float = 4.0):
     lin = (prof.hr_base + prof.hr_per_effort * met_lagged
            + prof.hr_per_degc * (np.asarray(ct) - 37.0) + prof.drift_per_min * active_min)
@@ -153,11 +169,12 @@ def run_heatsense(feat: pd.DataFrame, prof: Profile = Profile(),
     wm = np.array([lam / (n + lam), 0.5 / (n + lam), 0.5 / (n + lam)])
     wc = wm.copy()
     spread = np.sqrt(n + lam)
-    q, r = p.q_sd**2, prof.hr_noise_sd**2
+    q, r = p.q_sd**2, effective_hr_noise(prof) ** 2
 
     x, P = p.ct0, p.ct0_sd**2
     rows = []
-    for m, ml, act, w, hr in feat[["met_power", "met_lagged", "active_min", "wbgt", "hr"]].itertuples(index=False):
+    cols = ["met_power", "met_lagged", "active_min", "wbgt", "hr", "hr_coverage"]
+    for m, ml, act, w, hr, cov in feat[cols].itertuples(index=False):
         # Time update: push sigma points through the heat-balance physics.
         sig = x + spread * np.sqrt(P) * np.array([0.0, 1.0, -1.0])
         prop = physics_step(sig, m, w, p)
@@ -170,7 +187,8 @@ def run_heatsense(feat: pd.DataFrame, prof: Profile = Profile(),
         y_mean = float(wm @ y)
         innovation = np.nan
         if not np.isnan(hr):
-            pyy = float(wc @ (y - y_mean) ** 2) + r
+            # A minute averaged from fewer good seconds is a noisier observation.
+            pyy = float(wc @ (y - y_mean) ** 2) + r / np.clip(cov, 0.25, 1.0)
             pxy = float(wc @ ((sig - x) * (y - y_mean)))
             gain = pxy / pyy
             innovation = hr - y_mean
@@ -231,34 +249,74 @@ def calibrate(runs: list[pd.DataFrame], p: PhysicsParams = PhysicsParams(),
         # Too little pace variety to learn the slope: keep the population slope, fit the offset.
         notes.append(f"pace too uniform to learn effort slope (spread {pace_spread:.2f} W/kg): kept population slope")
         coef = np.array([float(np.mean(y - base.hr_per_effort * X[:, 1])), base.hr_per_effort])
-    resid = y - X @ coef
     all_hr = np.concatenate(hr_all)
+    fitted = Profile(**{**asdict(base), "hr_base": float(coef[0]), "hr_per_effort": float(coef[1])})
+    sd, rho = residual_noise(runs, fitted, p)
+    notes.append(f"heart-rate residuals: SD {sd:.1f} bpm, minute-to-minute correlation {rho:.2f}")
     notes.append("heat gain, heat sensitivity and drift: population values (need core-temperature reference to personalize)")
     return Profile(
         **{**asdict(base),
            "hr_base": float(coef[0]), "hr_per_effort": float(coef[1]),
            "hr_max": float(max(np.percentile(all_hr, 99.5) + 5, 185.0)),
-           "hr_noise_sd": float(np.clip(np.std(resid) * 1.5, 6.0, 12.0)),
+           "hr_noise_sd": sd, "hr_noise_rho": rho,
            "n_runs": len(runs), "n_minutes": n, "source": "calibrated offline from early minutes of past runs",
            "notes": notes},
     )
+
+
+def residual_noise(runs: list[pd.DataFrame], prof: Profile,
+                   p: PhysicsParams = PhysicsParams()) -> tuple[float, float]:
+    """SD and lag-1 autocorrelation of heart-rate residuals, OFFLINE, over all clean minutes.
+
+    Residual = measured HR - HR predicted from the fitted curve with physics-only core
+    temperature, over every clean running minute of the calibration runs (not just the
+    fitting window). Correlation uses pairs of consecutive minutes within a run.
+    """
+    resid, pairs = [], []
+    for feat in runs:
+        ct = physics_only(feat, personal_physics(p, prof.heat_gain))
+        pred = predict_hr(ct, feat["met_lagged"].to_numpy(), feat["active_min"].to_numpy(), prof)
+        e = feat["hr"].to_numpy() - pred
+        e[feat["paused"].to_numpy()] = np.nan
+        resid.append(e[~np.isnan(e)])
+        both = ~np.isnan(e[:-1]) & ~np.isnan(e[1:])
+        pairs.append(np.c_[e[:-1][both], e[1:][both]])
+    resid, pairs = np.concatenate(resid), np.vstack(pairs)
+    sd = float(np.std(resid))
+    rho = float(np.corrcoef(pairs.T)[0, 1]) if len(pairs) > 10 else Profile.hr_noise_rho
+    return float(np.clip(sd, 3.0, 15.0)), float(np.clip(rho, 0.0, 0.95))
 
 
 # ---------------------------------------------------------------- strain zones
 
 ZONES = ("green", "amber", "red", "check")
 
+# "check" when the estimate has become essentially physics-only: its SD is within 1% of the
+# open-loop SD (no heart rate at all). With usable heart rate the SD settles clearly below
+# that (0.34-0.38 degC at default noise vs 0.389 open loop), so this catches long or
+# repeated heart-rate gaps that the 3-of-5-minutes rule can miss.
+CHECK_SD_FRACTION = 0.99
 
-def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, trend_min: int = 10) -> pd.Series:
+
+def open_loop_sd(p: PhysicsParams = PhysicsParams()) -> float:
+    """Steady-state SD of the estimate with no heart rate, from process noise and tau."""
+    return p.q_sd / np.sqrt(1 - np.exp(-2.0 / p.tau_min))
+
+
+def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, trend_min: int = 10,
+                 p: PhysicsParams = PhysicsParams()) -> pd.Series:
     """PROVISIONAL zones from level, trend, heat stress and data quality.
 
     Thresholds are placeholders to be set from validation. Symptoms always override.
+    "check" = heart-rate data too poor to trust the estimate: at least 3 of the last 5
+    running minutes without heart rate, or SD at the open-loop level (see CHECK_SD_FRACTION).
     """
     ct = est["ct"].to_numpy()
     slope = (ct - np.r_[np.full(trend_min, ct[0]), ct[:-trend_min]]) / trend_min  # degC/min
     hot = feat["wbgt"].to_numpy() >= 28
-    bad = (pd.Series(np.isnan(feat["hr"].to_numpy()) & ~feat["paused"].to_numpy())
-           .rolling(5, min_periods=1).sum().to_numpy() >= 3) | (est["ct_sd"].to_numpy() > 0.5)
+    missing = pd.Series(np.isnan(feat["hr"].to_numpy()) & ~feat["paused"].to_numpy())
+    bad = ((missing.rolling(5, min_periods=1).sum().to_numpy() >= 3)
+           | (est["ct_sd"].to_numpy() >= CHECK_SD_FRACTION * open_loop_sd(p)))
     rising = slope >= 0.03  # ~1 degC per 30 min
 
     zone = np.full(len(ct), "green", dtype=object)

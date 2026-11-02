@@ -5,9 +5,10 @@ import pandas as pd
 import pytest
 
 from heatsense.effort import REST_W_PER_KG, minetti_cost
-from heatsense.evaluate import evaluate_synthetic, prepare
-from heatsense.model import (PhysicsParams, Profile, build_features, calibrate, ct_equilibrium,
-                             physics_only, predict_hr, run_heatsense, strain_zones)
+from heatsense.evaluate import evaluate_athletes, evaluate_synthetic, prepare
+from heatsense.model import (CHECK_SD_FRACTION, PhysicsParams, Profile, build_features, calibrate,
+                             ct_equilibrium, effective_hr_noise, open_loop_sd, physics_only,
+                             predict_hr, run_heatsense, strain_zones)
 
 
 def _feat(minutes=60, met=10.0, wbgt=18.0, hr=150.0, paused=None):
@@ -91,6 +92,49 @@ def test_zones():
     assert z.iloc[-1] == "red"
     f.loc[25:, "hr"] = np.nan
     assert strain_zones(est, f).iloc[-1] == "check"
+
+
+def test_correlated_noise_is_inflated():
+    assert effective_hr_noise(Profile(hr_noise_sd=5.0, hr_noise_rho=0.0)) == pytest.approx(5.0)
+    assert effective_hr_noise(Profile(hr_noise_sd=5.0, hr_noise_rho=0.8)) == pytest.approx(15.0)
+
+
+def test_calibration_estimates_residual_correlation():
+    prof = calibrate([prepare(7000 + i)["feat"] for i in range(5)])
+    assert 0.5 < prof.hr_noise_rho <= 0.95  # minute-level HR errors are strongly correlated
+    assert 3.0 <= prof.hr_noise_sd <= 15.0
+
+
+def test_partly_covered_minute_counts_less():
+    full, part = _feat(hr=180.0), _feat(hr=180.0)
+    part["hr_coverage"] = 0.5
+    assert run_heatsense(part)["ct"].iloc[5] < run_heatsense(full)["ct"].iloc[5]
+
+
+def test_check_sd_threshold_is_reached_only_without_heart_rate():
+    threshold = CHECK_SD_FRACTION * open_loop_sd()
+    f = _feat(minutes=80)
+    assert run_heatsense(f)["ct_sd"].max() < threshold
+    f.loc[20:, "hr"] = np.nan
+    assert run_heatsense(f)["ct_sd"].iloc[-1] >= threshold
+
+
+def test_check_zone_from_sd_alone():
+    f = _feat(minutes=30)  # heart rate present every minute
+    est = pd.DataFrame({"ct": np.full(30, 37.5), "ct_sd": np.full(30, 0.3)}, index=f.index)
+    assert (strain_zones(est, f) == "green").all()
+    est["ct_sd"] = open_loop_sd()
+    assert (strain_zones(est, f) == "check").all()
+
+
+def test_uncertainty_band_is_honest_on_simulated_athletes():
+    # Pooled over five simulated athletes (150 test runs), after minute 10.
+    r = evaluate_athletes()
+    for method in ("HeatSense, population default", "HeatSense, calibrated"):
+        g = r.xs(method, level="method")
+        w = g["minutes"] / g["minutes"].sum()
+        assert 0.60 <= (g["cover_1sd"] * w).sum() <= 0.75, method
+        assert 0.90 <= (g["cover_2sd"] * w).sum() <= 0.98, method
 
 
 def test_heatsense_beats_reference_baseline_on_simulated_athlete():

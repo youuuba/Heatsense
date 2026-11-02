@@ -30,12 +30,15 @@ def prepare(seed: int, heat_gain: float = 1.0, hr_offset: float = 0.0):
     return {"seed": seed, "info": info, "minutes": minutes, "feat": feat, "truth": truth.to_numpy()}
 
 
-def estimates(run: dict, profile: Profile) -> dict[str, np.ndarray]:
+def estimates(run: dict, profile: Profile) -> dict[str, tuple[np.ndarray, np.ndarray | None]]:
+    """Each method's (estimate, SD); SD is None for methods that don't report one."""
+    def ct_sd(df):
+        return df["ct"].to_numpy(), df["ct_sd"].to_numpy()
     return {
-        "Army baseline (HR only)": run_baseline(run["minutes"]["hr"])["ct"].to_numpy(),
-        "Physics only (no HR)": physics_only(run["feat"]),
-        "HeatSense, population default": run_heatsense(run["feat"], Profile())["ct"].to_numpy(),
-        "HeatSense, calibrated": run_heatsense(run["feat"], profile)["ct"].to_numpy(),
+        "Army baseline (HR only)": ct_sd(run_baseline(run["minutes"]["hr"])),
+        "Physics only (no HR)": (physics_only(run["feat"]), None),
+        "HeatSense, population default": ct_sd(run_heatsense(run["feat"], Profile())),
+        "HeatSense, calibrated": ct_sd(run_heatsense(run["feat"], profile)),
     }
 
 
@@ -50,13 +53,14 @@ def evaluate_synthetic(n_calibration: int = 8, n_test: int = 30, skip_minutes: i
     rows, per_run = [], []
     for run in test:
         est = estimates(run, profile)
-        for name, ct in est.items():
+        for name, (ct, sd) in est.items():
             m = compare(ct, run["truth"], skip_minutes=skip_minutes)
             per_run.append({"seed": run["seed"], "method": name, "wbgt": run["info"]["wbgt"],
                             "indoor": run["info"]["indoor"], **m})
             truth = run["truth"][skip_minutes:]
             e = ct[skip_minutes:]
-            rows.append(pd.DataFrame({"method": name, "err": e - truth,
+            z = (e - truth) / sd[skip_minutes:] if sd is not None else np.full(len(e), np.nan)
+            rows.append(pd.DataFrame({"method": name, "err": e - truth, "z": z,
                                       "hot": truth >= hot_threshold, "flag": e >= hot_threshold}))
     allm = pd.concat(rows)
     summary = allm.groupby("method").apply(lambda g: pd.Series({
@@ -64,6 +68,9 @@ def evaluate_synthetic(n_calibration: int = 8, n_test: int = 30, skip_minutes: i
         "bias_C": g["err"].mean(),
         "rmse_C": np.sqrt((g["err"] ** 2).mean()),
         "mae_C": g["err"].abs().mean(),
+        # Share of true values inside the reported ±1 / ±2 SD band (NaN: method has no SD).
+        "cover_1sd": (g["z"].abs() <= 1).mean() if g["z"].notna().any() else np.nan,
+        "cover_2sd": (g["z"].abs() <= 2).mean() if g["z"].notna().any() else np.nan,
         f"hot_minutes_caught_(>={hot_threshold})": (g["flag"] & g["hot"]).sum() / max(g["hot"].sum(), 1),
         "false_hot_alarms": (g["flag"] & ~g["hot"]).sum() / max((~g["hot"]).sum(), 1),
     }), include_groups=False)
