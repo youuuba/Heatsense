@@ -49,38 +49,52 @@ def run_location(seconds):
     return round(float(seconds["lat"].median()), 2), round(float(seconds["lon"].median()), 2)
 
 
+WX_SOURCES = ("open-meteo", "manual", "indoor-assumed", "unknown-conservative")
+
+
+def choose_weather(minutes, location, weather: bool = True, fixed_wbgt: float | None = None,
+                   physics: PhysicsParams = PhysicsParams()):
+    """Heat stress for a run -> (wbgt, weather table or None, source, note).
+
+    ``source`` is one of WX_SOURCES, so every assumption stays visible. When weather is
+    unknown (lookup skipped or failed) the fallback is deliberately hot, never mild.
+    """
+    if fixed_wbgt is not None:
+        return fixed_wbgt, None, "manual", f"Heat stress set manually: WBGT {fixed_wbgt:.0f} °C."
+    if location is None:
+        return (physics.indoor_wbgt, None, "indoor-assumed",
+                f"Indoor / no GPS: ASSUMED WBGT {physics.indoor_wbgt:.0f} °C (not measured).")
+    if weather:
+        try:
+            wx = run_weather(minutes, *location)
+            moving = ~minutes["paused"]
+            note = (f"Weather: {wx['air_temp'][moving].mean():.0f} °C, {wx['rh'][moving].mean():.0f}% RH, "
+                    f"WBGT ≈ {wx['wbgt_est'][moving].mean():.0f} °C (Open-Meteo, location rounded to ~1 km).")
+            return wx["wbgt_est"].to_numpy(), wx, "open-meteo", note
+        except Exception as exc:  # network down, API change: analysis still runs
+            why = f"Weather unavailable ({type(exc).__name__})"
+    else:
+        why = "Weather lookup skipped"
+    return (physics.unknown_wbgt, None, "unknown-conservative",
+            f"{why}: ASSUMED hot WBGT {physics.unknown_wbgt:.0f} °C to stay on the safe side.")
+
+
 def prepare_run(seconds, weather: bool = True, fixed_wbgt: float | None = None,
                 physics: PhysicsParams = PhysicsParams()):
-    """Per-second data -> (checked seconds, minute table, model features, weather, note)."""
+    """Per-second data -> (checked seconds, minute table, model features, weather, note, source)."""
     location = run_location(seconds)
     seconds = seconds.drop(columns=["lat", "lon"], errors="ignore")  # never kept past here
     checked = check_hr(seconds)
     minutes = to_minutes(checked)
-    wx = None
-    if fixed_wbgt is not None:
-        wbgt, note = fixed_wbgt, f"Heat stress set to WBGT {fixed_wbgt:.0f} °C."
-    elif location is None:
-        wbgt, note = physics.indoor_wbgt, f"Indoor / no GPS: assumed WBGT {physics.indoor_wbgt:.0f} °C."
-    elif not weather:
-        wbgt, note = physics.unknown_wbgt, f"Weather lookup skipped: assumed WBGT {physics.unknown_wbgt:.0f} °C."
-    else:
-        try:
-            wx = run_weather(minutes, *location)
-            wbgt = wx["wbgt_est"].to_numpy()
-            moving = ~minutes["paused"]
-            note = (f"Weather: {wx['air_temp'][moving].mean():.0f} °C, {wx['rh'][moving].mean():.0f}% RH, "
-                    f"WBGT ≈ {wx['wbgt_est'][moving].mean():.0f} °C (Open-Meteo, location rounded to ~1 km).")
-        except Exception as exc:  # network down, API change: analysis still runs
-            wbgt = physics.unknown_wbgt
-            note = f"Weather unavailable ({type(exc).__name__}): assumed WBGT {wbgt:.0f} °C."
+    wbgt, wx, source, note = choose_weather(minutes, location, weather, fixed_wbgt, physics)
     feat = build_features(minutes, minute_effort(checked, len(minutes)), wbgt, physics)
-    return checked, minutes, feat, wx, note
+    return checked, minutes, feat, wx, note, source
 
 
 def _analyze(seconds, title, out_png, out_csv, profile: Profile, ref_col=None,
              ref_label="Reference (core sensor)", weather=True, fixed_wbgt=None, note_override=None):
-    checked, minutes, feat, wx, note = prepare_run(seconds, weather, fixed_wbgt)
-    note = note_override or note
+    checked, minutes, feat, wx, note, wx_source = prepare_run(seconds, weather, fixed_wbgt)
+    note = f"{note_override or note} Weather source: {wx_source}."
     hs = run_heatsense(feat, profile)
     zones = strain_zones(hs, feat)
     base = run_baseline(minutes["hr"])
@@ -94,7 +108,7 @@ def _analyze(seconds, title, out_png, out_csv, profile: Profile, ref_col=None,
              baseline=base, zones=zones["zone"], low_confidence=zones["low_confidence"],
              profile_label=profile.source)
 
-    table = minutes.join(feat[["met_power", "wbgt"]]).join(hs).join(zones)
+    table = minutes.join(feat[["met_power", "wbgt"]]).assign(wx_source=wx_source).join(hs).join(zones)
     table = table.join(base.rename(columns={"ct": "baseline_ct", "ct_sd": "baseline_sd", "gain": "baseline_gain"}))
     if wx is not None:
         table = table.join(wx.drop(columns=["wbgt_est"]))
@@ -151,8 +165,8 @@ def main(argv=None):
     if args.cmd == "calibrate":
         feats = []
         for f in expand_paths(args.fits):
-            _, _, feat, _, note = prepare_run(read_fit(f, keep_gps=True), weather=not args.no_weather)
-            print(f"  {f.name}: {len(feat)} min. {note}")
+            _, _, feat, _, note, source = prepare_run(read_fit(f, keep_gps=True), weather=not args.no_weather)
+            print(f"  {f.name}: {len(feat)} min. {note} [{source}]")
             feats.append(feat)
         prof = calibrate(feats)
         prof.save(args.out)

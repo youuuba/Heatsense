@@ -59,8 +59,10 @@ class PhysicsParams:
     q_sd: float = 0.11
     ct0: float = 37.0
     ct0_sd: float = 0.15
-    indoor_wbgt: float = 18.0  # assumed for treadmill / indoor runs
-    unknown_wbgt: float = 18.0  # fallback when weather is unavailable
+    indoor_wbgt: float = 18.0  # ASSUMED for treadmill / indoor runs (labelled as an assumption)
+    # Fallback when outdoor weather is unknown: deliberately hot, so a failed lookup can't
+    # silently make a hot day look mild.
+    unknown_wbgt: float = 28.0
 
 
 @dataclass
