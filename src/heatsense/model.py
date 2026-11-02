@@ -3,12 +3,13 @@
 How it works, once per minute:
 
 1. Physics (time update). Core temperature moves toward an equilibrium set by effort
-   and heat stress, with a time constant of ~20 min:
+   and heat stress, with a time constant of ~20 min (~45 min for passive cooling when stopped):
 
        CT_eq = CT_rest + a_effort * (M - M_rest) + a_env * max(WBGT - WBGT_ref, 0) * M / 10
        CT_t  = CT_eq + (CT_{t-1} - CT_eq) * exp(-1 / tau)
 
-   M is metabolic power (W/kg, from pace and slope). Stopped -> M = rest -> CT cools.
+   M is metabolic power (W/kg, from pace and slope). Stopped -> M = rest -> CT cools,
+   but only after a short delay (core temperature keeps up for a few minutes after a stop).
 
 2. Heart-rate observation. Heart rate is explained by several causes, not heat alone:
 
@@ -44,7 +45,10 @@ from .effort import REST_W_PER_KG
 @dataclass(frozen=True)
 class PhysicsParams:
     ct_rest: float = 37.0  # degC
-    tau_min: float = 20.0  # core temperature time constant, minutes
+    tau_min: float = 20.0  # core temperature time constant while heating, minutes
+    # Passive cooling is much slower than heating: ~0.03-0.05 degC/min from ~39.5 degC.
+    tau_cool_min: float = 45.0  # used while stopped, when the equilibrium is below the state
+    cool_delay_min: int = 3  # after a stop, core temperature doesn't start falling for this long
     a_effort: float = 0.15  # degC per W/kg above rest (temperate conditions)
     a_env: float = 0.057  # extra degC per degC WBGT above ref, per 10 W/kg
     wbgt_ref: float = 15.0  # degC; below this, environment adds no heat strain
@@ -52,7 +56,7 @@ class PhysicsParams:
     # Process noise, degC per minute. Large on purpose: it stands for the physics model's own
     # error (heat gain differs between runners and isn't learned), not true minute-to-minute
     # randomness. Tuned so the ±2 SD band covers ~95% of true values on simulated athletes.
-    q_sd: float = 0.12
+    q_sd: float = 0.11
     ct0: float = 37.0
     ct0_sd: float = 0.15
     indoor_wbgt: float = 18.0  # assumed for treadmill / indoor runs
@@ -125,9 +129,26 @@ def ct_equilibrium(met, wbgt, p: PhysicsParams):
     return p.ct_rest + p.a_effort * (np.asarray(met) - REST_W_PER_KG) + p.a_env * heat * np.asarray(met) / 10
 
 
-def physics_step(ct, met, wbgt, p: PhysicsParams):
+def physics_step(ct, met, wbgt, p: PhysicsParams, stopped: bool = False, hold: bool = False):
+    """One minute of physics.
+
+    ``stopped``: passive cooling, slower (``tau_cool_min``). While running, heating and
+    cooling share ``tau_min``. ``hold``: just after a stop, core temperature can't fall yet.
+    """
+    ct = np.asarray(ct, dtype=float)
     eq = ct_equilibrium(met, wbgt, p)
-    return eq + (np.asarray(ct) - eq) * np.exp(-1.0 / p.tau_min)
+    tau = np.where(stopped & (eq < ct), p.tau_cool_min, p.tau_min)
+    new = eq + (ct - eq) * np.exp(-1.0 / tau)
+    return np.maximum(new, ct) if hold else new
+
+
+def cooling_hold(paused) -> np.ndarray:
+    """Minute index -> how many consecutive stopped minutes so far (0 while moving)."""
+    run, out = 0, np.zeros(len(paused), dtype=int)
+    for i, stopped in enumerate(np.asarray(paused, dtype=bool)):
+        run = run + 1 if stopped else 0
+        out[i] = run
+    return out
 
 
 def effective_hr_noise(prof: Profile) -> float:
@@ -152,8 +173,10 @@ def predict_hr(ct, met_lagged, active_min, prof: Profile, k: float = 4.0):
 def physics_only(feat: pd.DataFrame, p: PhysicsParams = PhysicsParams()) -> np.ndarray:
     """Open-loop core temperature from effort and weather alone (no heart rate)."""
     ct, out = p.ct0, np.empty(len(feat))
+    stopped_for = cooling_hold(feat["paused"])
     for i, (m, w) in enumerate(zip(feat["met_power"], feat["wbgt"])):
-        ct = float(physics_step(ct, m, w, p))
+        ct = float(physics_step(ct, m, w, p, stopped=stopped_for[i] > 0,
+                                hold=0 < stopped_for[i] <= p.cool_delay_min))
         out[i] = ct
     return out
 
@@ -172,12 +195,19 @@ def run_heatsense(feat: pd.DataFrame, prof: Profile = Profile(),
     q, r = p.q_sd**2, effective_hr_noise(prof) ** 2
 
     x, P = p.ct0, p.ct0_sd**2
+    P_open = P  # what the variance would be with no heart rate at all (for the "check" zone)
     rows = []
     cols = ["met_power", "met_lagged", "active_min", "wbgt", "hr", "hr_coverage"]
-    for m, ml, act, w, hr, cov in feat[cols].itertuples(index=False):
+    stopped_for = cooling_hold(feat["paused"])
+    for i, (m, ml, act, w, hr, cov) in enumerate(feat[cols].itertuples(index=False)):
+        stop = {"stopped": stopped_for[i] > 0, "hold": 0 < stopped_for[i] <= p.cool_delay_min}
+        sig = x + spread * np.sqrt(P_open) * np.array([0.0, 1.0, -1.0])
+        prop = physics_step(sig, m, w, p, **stop)
+        P_open = float(wc @ (prop - wm @ prop) ** 2) + q
+
         # Time update: push sigma points through the heat-balance physics.
         sig = x + spread * np.sqrt(P) * np.array([0.0, 1.0, -1.0])
-        prop = physics_step(sig, m, w, p)
+        prop = physics_step(sig, m, w, p, **stop)
         x = float(wm @ prop)
         P = float(wc @ (prop - x) ** 2) + q
 
@@ -194,9 +224,10 @@ def run_heatsense(feat: pd.DataFrame, prof: Profile = Profile(),
             innovation = hr - y_mean
             x = x + gain * innovation
             P = max(P - gain**2 * pyy, 1e-6)
-        rows.append((x, np.sqrt(P), y_mean, innovation))
+        rows.append((x, np.sqrt(P), np.sqrt(P_open), y_mean, innovation))
 
-    return pd.DataFrame(rows, columns=["ct", "ct_sd", "hr_pred", "innovation"], index=feat.index)
+    return pd.DataFrame(rows, columns=["ct", "ct_sd", "ct_sd_open", "hr_pred", "innovation"],
+                        index=feat.index)
 
 
 # ---------------------------------------------------------------- offline calibration
@@ -311,16 +342,41 @@ class ZoneThresholds:
     trend_min: int = 10
     # Low confidence ("check") when heart rate is missing in >= check_missing of the last
     # check_window running minutes, or when the estimate has become essentially
-    # physics-only: SD within 1% of the open-loop SD (no heart rate at all). With usable
-    # heart rate the SD settles clearly below that (0.34-0.38 degC at default noise vs
-    # 0.389 open loop), so the SD rule catches long or repeated gaps the window can miss.
+    # physics-only: SD within 1% of the SD the same run would have with no heart rate at
+    # all (``ct_sd_open`` from the filter). With usable heart rate the SD stays clearly
+    # below that, so the SD rule catches long or repeated gaps the window can miss.
     check_missing: int = 3
     check_window: int = 5
     check_sd_fraction: float = 0.99
+    check_sd_floor: float = 0.9  # ...and SD at least this share of the heating open-loop SD
+    # Zone hold: warnings rise at once but ease off slowly (e.g. after a stop, the estimate
+    # falls faster than the risk does). At most one level down per hold_step_min, and no
+    # green until hold_green_min after the last amber/red level.
+    hold_step_min: int = 5
+    hold_green_min: int = 10
+
+
+LEVELS = ("green", "amber", "red")
+
+
+def hold_zones(level: np.ndarray, th: ZoneThresholds = ZoneThresholds()) -> np.ndarray:
+    """Apply the zone hold to per-minute levels (0 green, 1 amber, 2 red)."""
+    shown, out = 0, np.zeros(len(level), dtype=int)
+    changed, last_warn = -10**9, -10**9
+    for i, raw in enumerate(level):
+        if raw >= 1:
+            last_warn = i
+        if raw >= shown:  # (re)confirms the shown level: the hold restarts
+            shown, changed = raw, i
+        elif raw < shown and i - changed >= th.hold_step_min:
+            if shown - 1 >= 1 or i - last_warn >= th.hold_green_min:
+                shown, changed = shown - 1, i
+        out[i] = shown
+    return out
 
 
 def open_loop_sd(p: PhysicsParams = PhysicsParams()) -> float:
-    """Steady-state SD of the estimate with no heart rate, from process noise and tau."""
+    """Steady-state SD with no heart rate while heating (fallback when ``ct_sd_open`` is absent)."""
     return p.q_sd / np.sqrt(1 - np.exp(-2.0 / p.tau_min))
 
 
@@ -331,7 +387,7 @@ def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, p: PhysicsParams = Physi
     Returns columns ``zone``, ``ct_upper`` and ``low_confidence``. When confidence is low
     the estimate is still reported, but the zone is never green: a green level becomes
     "check", while amber and red stay visible (bad data must not hide a warning).
-    Symptoms always override.
+    Levels then pass through the zone hold (``hold_zones``). Symptoms always override.
     """
     ct = est["ct"].to_numpy()
     upper = ct + th.upper_z * est["ct_sd"].to_numpy()
@@ -340,12 +396,18 @@ def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, p: PhysicsParams = Physi
     rising = slope >= th.rising_c_per_min
     hot = feat["wbgt"].to_numpy() >= th.hot_wbgt
     missing = pd.Series(np.isnan(feat["hr"].to_numpy()) & ~feat["paused"].to_numpy())
+    sd = est["ct_sd"].to_numpy()
+    sd_open = est["ct_sd_open"].to_numpy() if "ct_sd_open" in est else open_loop_sd(p)
+    # Physics-only AND no longer small: at the start both SDs are still near the trusted
+    # resting prior, which is not a reason to doubt the estimate.
+    physics_only_sd = (sd >= th.check_sd_fraction * sd_open) & (sd >= th.check_sd_floor * open_loop_sd(p))
     low_conf = ((missing.rolling(th.check_window, min_periods=1).sum().to_numpy() >= th.check_missing)
-                | (est["ct_sd"].to_numpy() >= th.check_sd_fraction * open_loop_sd(p)))
+                | physics_only_sd)
 
-    zone = np.full(len(ct), "green", dtype=object)
-    zone[(upper >= th.amber_ct) | ((upper >= th.amber_rising_ct) & rising)
-         | (hot & (upper >= th.amber_hot_ct))] = "amber"
-    zone[(upper >= th.red_ct) | ((upper >= th.red_rising_ct) & rising)] = "red"
+    level = np.zeros(len(ct), dtype=int)
+    level[(upper >= th.amber_ct) | ((upper >= th.amber_rising_ct) & rising)
+          | (hot & (upper >= th.amber_hot_ct))] = 1
+    level[(upper >= th.red_ct) | ((upper >= th.red_rising_ct) & rising)] = 2
+    zone = np.array(LEVELS, dtype=object)[hold_zones(level, th)]
     zone[low_conf & (zone == "green")] = "check"
     return pd.DataFrame({"zone": zone, "ct_upper": upper, "low_confidence": low_conf}, index=est.index)

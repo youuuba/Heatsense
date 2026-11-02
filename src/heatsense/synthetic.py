@@ -115,7 +115,9 @@ def make_athlete_run(seed: int, minutes: int | None = None,
     x = 37.0 + rng.normal(0, 0.1)
     for i in range(n):
         eq = 36.9 + heat_gain * 0.13 * (met[i] - REST_W_PER_KG) * (1 + 0.06 * max(wbgt - 12, 0))
-        tau = 25 * 60 if eq > x else 15 * 60
+        # Realistic slow passive cooling (~0.04 degC/min from 39.5); deliberately not the
+        # model's 45 min, and no post-stop delay, so the evaluation isn't circular.
+        tau = 25 * 60 if eq > x else 60 * 60
         creep = 0.004 / 60 * max(wbgt - 26, 0) * (met[i] > 4)
         x += (eq - x) / tau + creep
         ct[i] = x
