@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 from pathlib import Path
 
 from .baseline import run_baseline
@@ -19,6 +20,21 @@ from .model import PhysicsParams, Profile, build_features, calibrate, run_heatse
 from .plot import plot_run
 from .quality import check_hr, summarize
 from .weather import run_weather
+
+
+def expand_paths(paths):
+    """Expand wildcards ourselves: PowerShell and cmd pass `runs/*.fit` through literally."""
+    out = []
+    for p in paths:
+        matches = sorted(glob.glob(str(p))) if any(c in str(p) for c in "*?[") else [str(p)]
+        if not matches:
+            raise SystemExit(f"No files match {p}")
+        out.extend(Path(m) for m in matches)
+    # Windows globs ignore case, so `*.fit *.FIT` can list the same run twice
+    unique = {}
+    for p in out:
+        unique.setdefault(p.resolve(), p)
+    return list(unique.values())
 
 
 def run_location(seconds):
@@ -79,6 +95,7 @@ def _analyze(seconds, title, out_png, out_csv, profile: Profile, ref_col=None,
     if reference is not None:
         table["reference_ct"] = reference
     if out_csv:
+        Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
         table.drop(columns="time").to_csv(out_csv, float_format="%.3f")
 
     q = summarize(checked)
@@ -124,7 +141,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.cmd == "calibrate":
         feats = []
-        for f in args.fits:
+        for f in expand_paths(args.fits):
             _, _, feat, _, note = prepare_run(read_fit(f, keep_gps=True), weather=not args.no_weather)
             print(f"  {f.name}: {len(feat)} min. {note}")
             feats.append(feat)

@@ -74,6 +74,7 @@ class Profile:
     notes: list[str] = field(default_factory=list)
 
     def save(self, path: str | Path) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps(asdict(self), indent=2))
 
     @classmethod

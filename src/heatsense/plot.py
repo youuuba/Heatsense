@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import matplotlib
 
 matplotlib.use("Agg")
@@ -123,6 +125,7 @@ def plot_run(
     fig.text(0.06, 0.935, f"{note}\n{sub}" if note else sub, fontsize=8.5, color=INK_2, va="top")
     fig.tight_layout(rect=(0, 0, 1, 0.90))
     if path:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(path, dpi=150, facecolor=SURFACE)
         plt.close(fig)
     return fig
