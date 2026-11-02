@@ -26,9 +26,14 @@ def expand_paths(paths):
     """Expand wildcards ourselves: PowerShell and cmd pass `runs/*.fit` through literally."""
     out = []
     for p in paths:
-        matches = sorted(glob.glob(str(p))) if any(c in str(p) for c in "*?[") else [str(p)]
-        if not matches:
-            raise SystemExit(f"No files match {p}")
+        if any(c in str(p) for c in "*?["):
+            matches = sorted(glob.glob(str(p)))
+            if not matches:
+                raise SystemExit(f"No files match {p}")
+        else:
+            if not Path(p).exists():
+                raise SystemExit(f"File not found: {p}")
+            matches = [str(p)]
         out.extend(Path(m) for m in matches)
     # Windows globs ignore case, so `*.fit *.FIT` can list the same run twice
     unique = {}
