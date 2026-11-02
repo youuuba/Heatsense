@@ -91,7 +91,8 @@ def _analyze(seconds, title, out_png, out_csv, profile: Profile, ref_col=None,
         reference = checked[ref_col].groupby(elapsed).mean().reindex(minutes.index)
 
     plot_run(checked, minutes, hs, reference, ref_label, title, note=note, path=out_png,
-             baseline=base, zones=zones, profile_label=profile.source)
+             baseline=base, zones=zones["zone"], low_confidence=zones["low_confidence"],
+             profile_label=profile.source)
 
     table = minutes.join(feat[["met_power", "wbgt"]]).join(hs).join(zones)
     table = table.join(base.rename(columns={"ct": "baseline_ct", "ct_sd": "baseline_sd", "gain": "baseline_gain"}))
@@ -109,8 +110,11 @@ def _analyze(seconds, title, out_png, out_csv, profile: Profile, ref_col=None,
     for name, share in q.items():
         if name != "usable" and share > 0:
             print(f"  flagged {name}: {share:.1%}")
-    print(f"  HeatSense peak {hs['ct'].max():.2f} °C, zones {zones.value_counts().to_dict()} "
+    print(f"  HeatSense peak {hs['ct'].max():.2f} °C, zones {zones['zone'].value_counts().to_dict()} "
           f"| reference baseline peak {base['ct'].max():.2f} °C")
+    if zones["low_confidence"].any():
+        print(f"  low confidence (heart-rate data poor) in {int(zones['low_confidence'].sum())} min: "
+              "estimate shown, never green")
     if reference is not None:
         for name, est in (("HeatSense", hs["ct"]), ("baseline", base["ct"])):
             m = compare(est, reference, skip_minutes=10)

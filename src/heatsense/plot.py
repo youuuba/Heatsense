@@ -35,6 +35,7 @@ def plot_run(
     baseline: pd.DataFrame | None = None,
     zones: pd.Series | None = None,
     profile_label: str | None = None,
+    low_confidence: pd.Series | None = None,
 ):
     t_sec = (seconds.index - seconds.index[0]).total_seconds() / 60
     t_min = minutes.index.to_numpy() + 0.5
@@ -86,12 +87,16 @@ def plot_run(
             if on.any():
                 ax.bar(minutes.index.to_numpy()[on] + 0.5, 1, width=1.0, color=color, lw=0,
                        label=f"{name.capitalize()} ({on.mean():.0%})")
+        if low_confidence is not None and low_confidence.any():
+            lc = low_confidence.to_numpy(dtype=bool)
+            ax.bar(minutes.index.to_numpy()[lc] + 0.5, 1, width=1.0, fill=False, hatch="///",
+                   edgecolor=INK_2, lw=0, label=f"Low confidence ({lc.mean():.0%})")
         ax.set_yticks([])
         ax.set_ylim(0, 1)
         ax.set_ylabel("Zone", rotation=0, ha="right", va="center")
         ax.set_xlabel("Elapsed time (min)")
         axes[2].set_xlabel("")
-        ax.legend(loc="lower right", bbox_to_anchor=(1.0, 1.05), ncol=4, fontsize=8, frameon=False,
+        ax.legend(loc="lower right", bbox_to_anchor=(1.0, 1.05), ncol=5, fontsize=8, frameon=False,
                   labelcolor=INK_2, handlelength=1.0, borderaxespad=0)
 
     # Shade paused / stopped minutes on every panel (one legend entry, on the top panel).

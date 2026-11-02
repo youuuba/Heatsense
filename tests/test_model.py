@@ -6,7 +6,7 @@ import pytest
 
 from heatsense.effort import REST_W_PER_KG, minetti_cost
 from heatsense.evaluate import evaluate_athletes, evaluate_synthetic, prepare
-from heatsense.model import (CHECK_SD_FRACTION, PhysicsParams, Profile, build_features, calibrate,
+from heatsense.model import (PhysicsParams, Profile, ZoneThresholds, build_features, calibrate,
                              ct_equilibrium, effective_hr_noise, open_loop_sd, physics_only,
                              predict_hr, run_heatsense, strain_zones)
 
@@ -87,11 +87,34 @@ def test_zones():
     f = _feat(minutes=30)
     est = pd.DataFrame({"ct": np.r_[np.full(10, 37.5), np.linspace(37.5, 39.0, 10), np.full(10, 39.9)],
                         "ct_sd": np.full(30, 0.1)}, index=f.index)
-    z = strain_zones(est, f)
+    z = strain_zones(est, f)["zone"]
     assert z.iloc[5] == "green"
     assert z.iloc[-1] == "red"
     f.loc[25:, "hr"] = np.nan
-    assert strain_zones(est, f).iloc[-1] == "check"
+    out = strain_zones(est, f)
+    assert out["zone"].iloc[-1] == "red"  # bad data never hides a warning...
+    assert out["low_confidence"].iloc[-1]  # ...but it is labelled low confidence
+    assert out["zone"].iloc[5] == "green" and not out["low_confidence"].iloc[5]
+
+
+def test_zones_use_upper_bound_not_mean():
+    f = _feat(minutes=30)
+    est = pd.DataFrame({"ct": np.full(30, 38.7), "ct_sd": np.zeros(30)}, index=f.index)
+    assert (strain_zones(est, f)["zone"] == "green").all()  # mean alone is below amber
+    est["ct_sd"] = 0.2  # upper bound 38.7 + 1.64 * 0.2 = 39.03
+    out = strain_zones(est, f)
+    assert (out["zone"] == "amber").all()
+    assert out["ct_upper"].iloc[0] == pytest.approx(38.7 + ZoneThresholds().upper_z * 0.2)
+
+
+def test_low_confidence_is_never_green_and_keeps_estimate():
+    f = _feat(minutes=30)
+    f.loc[10:, "hr"] = np.nan
+    est = pd.DataFrame({"ct": np.full(30, 37.3), "ct_sd": np.full(30, 0.1)}, index=f.index)
+    out = strain_zones(est, f)
+    assert not (out["low_confidence"] & (out["zone"] == "green")).any()
+    assert (out["zone"].iloc[13:] == "check").all()
+    assert out["ct_upper"].notna().all()  # the estimate is still reported
 
 
 def test_correlated_noise_is_inflated():
@@ -112,7 +135,7 @@ def test_partly_covered_minute_counts_less():
 
 
 def test_check_sd_threshold_is_reached_only_without_heart_rate():
-    threshold = CHECK_SD_FRACTION * open_loop_sd()
+    threshold = ZoneThresholds().check_sd_fraction * open_loop_sd()
     f = _feat(minutes=80)
     assert run_heatsense(f)["ct_sd"].max() < threshold
     f.loc[20:, "hr"] = np.nan
@@ -122,9 +145,9 @@ def test_check_sd_threshold_is_reached_only_without_heart_rate():
 def test_check_zone_from_sd_alone():
     f = _feat(minutes=30)  # heart rate present every minute
     est = pd.DataFrame({"ct": np.full(30, 37.5), "ct_sd": np.full(30, 0.3)}, index=f.index)
-    assert (strain_zones(est, f) == "green").all()
+    assert (strain_zones(est, f)["zone"] == "green").all()
     est["ct_sd"] = open_loop_sd()
-    assert (strain_zones(est, f) == "check").all()
+    assert (strain_zones(est, f)["zone"] == "check").all()
 
 
 def test_uncertainty_band_is_honest_on_simulated_athletes():

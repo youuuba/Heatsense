@@ -291,11 +291,32 @@ def residual_noise(runs: list[pd.DataFrame], prof: Profile,
 
 ZONES = ("green", "amber", "red", "check")
 
-# "check" when the estimate has become essentially physics-only: its SD is within 1% of the
-# open-loop SD (no heart rate at all). With usable heart rate the SD settles clearly below
-# that (0.34-0.38 degC at default noise vs 0.389 open loop), so this catches long or
-# repeated heart-rate gaps that the 3-of-5-minutes rule can miss.
-CHECK_SD_FRACTION = 0.99
+
+@dataclass(frozen=True)
+class ZoneThresholds:
+    """PROVISIONAL strain-zone thresholds: placeholders until validation sets them.
+
+    All core-temperature levels are compared with the UPPER bound ct + upper_z * ct_sd
+    (one-sided 95%), not the mean, so an uncertain estimate leans toward warning.
+    """
+
+    upper_z: float = 1.64
+    amber_ct: float = 39.0  # amber at this upper bound...
+    amber_rising_ct: float = 38.5  # ...or this one while rising
+    amber_hot_ct: float = 38.5  # ...or this one in hot weather
+    red_ct: float = 39.7  # red at this upper bound...
+    red_rising_ct: float = 39.2  # ...or this one while rising
+    hot_wbgt: float = 28.0  # degC
+    rising_c_per_min: float = 0.03  # ~1 degC per 30 min, on the mean estimate
+    trend_min: int = 10
+    # Low confidence ("check") when heart rate is missing in >= check_missing of the last
+    # check_window running minutes, or when the estimate has become essentially
+    # physics-only: SD within 1% of the open-loop SD (no heart rate at all). With usable
+    # heart rate the SD settles clearly below that (0.34-0.38 degC at default noise vs
+    # 0.389 open loop), so the SD rule catches long or repeated gaps the window can miss.
+    check_missing: int = 3
+    check_window: int = 5
+    check_sd_fraction: float = 0.99
 
 
 def open_loop_sd(p: PhysicsParams = PhysicsParams()) -> float:
@@ -303,24 +324,28 @@ def open_loop_sd(p: PhysicsParams = PhysicsParams()) -> float:
     return p.q_sd / np.sqrt(1 - np.exp(-2.0 / p.tau_min))
 
 
-def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, trend_min: int = 10,
-                 p: PhysicsParams = PhysicsParams()) -> pd.Series:
-    """PROVISIONAL zones from level, trend, heat stress and data quality.
+def strain_zones(est: pd.DataFrame, feat: pd.DataFrame, p: PhysicsParams = PhysicsParams(),
+                 th: ZoneThresholds = ZoneThresholds()) -> pd.DataFrame:
+    """PROVISIONAL zones from the upper bound, trend, heat stress and data quality.
 
-    Thresholds are placeholders to be set from validation. Symptoms always override.
-    "check" = heart-rate data too poor to trust the estimate: at least 3 of the last 5
-    running minutes without heart rate, or SD at the open-loop level (see CHECK_SD_FRACTION).
+    Returns columns ``zone``, ``ct_upper`` and ``low_confidence``. When confidence is low
+    the estimate is still reported, but the zone is never green: a green level becomes
+    "check", while amber and red stay visible (bad data must not hide a warning).
+    Symptoms always override.
     """
     ct = est["ct"].to_numpy()
-    slope = (ct - np.r_[np.full(trend_min, ct[0]), ct[:-trend_min]]) / trend_min  # degC/min
-    hot = feat["wbgt"].to_numpy() >= 28
+    upper = ct + th.upper_z * est["ct_sd"].to_numpy()
+    n = th.trend_min
+    slope = (ct - np.r_[np.full(n, ct[0]), ct[:-n]]) / n  # degC/min
+    rising = slope >= th.rising_c_per_min
+    hot = feat["wbgt"].to_numpy() >= th.hot_wbgt
     missing = pd.Series(np.isnan(feat["hr"].to_numpy()) & ~feat["paused"].to_numpy())
-    bad = ((missing.rolling(5, min_periods=1).sum().to_numpy() >= 3)
-           | (est["ct_sd"].to_numpy() >= CHECK_SD_FRACTION * open_loop_sd(p)))
-    rising = slope >= 0.03  # ~1 degC per 30 min
+    low_conf = ((missing.rolling(th.check_window, min_periods=1).sum().to_numpy() >= th.check_missing)
+                | (est["ct_sd"].to_numpy() >= th.check_sd_fraction * open_loop_sd(p)))
 
     zone = np.full(len(ct), "green", dtype=object)
-    zone[(ct >= 39.0) | ((ct >= 38.5) & rising) | (hot & (ct >= 38.5))] = "amber"
-    zone[(ct >= 39.7) | ((ct >= 39.2) & rising)] = "red"
-    zone[bad] = "check"
-    return pd.Series(zone, index=est.index, name="zone")
+    zone[(upper >= th.amber_ct) | ((upper >= th.amber_rising_ct) & rising)
+         | (hot & (upper >= th.amber_hot_ct))] = "amber"
+    zone[(upper >= th.red_ct) | ((upper >= th.red_rising_ct) & rising)] = "red"
+    zone[low_conf & (zone == "green")] = "check"
+    return pd.DataFrame({"zone": zone, "ct_upper": upper, "low_confidence": low_conf}, index=est.index)
